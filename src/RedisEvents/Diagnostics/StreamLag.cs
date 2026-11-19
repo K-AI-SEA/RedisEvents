@@ -105,6 +105,13 @@ internal sealed class StreamPartitionMonitor
     private bool behind;
     private long behindSince;
 
+    /// <summary>
+    /// The shared multiplexer of the server this partition's stream lives on, set by the consumer
+    /// host. The process-wide sampler reads the tail over it, so a topic on a named connection is
+    /// sampled where it lives; <see langword="null"/> falls back to the sampler's own multiplexer.
+    /// </summary>
+    internal IConnectionMultiplexer? Connection { get; set; }
+
     internal StreamPartitionMonitor(
         string topic,
         string consumer,
@@ -929,11 +936,14 @@ internal sealed class StreamLagSampler : IAsyncDisposable
     /// <returns>A task that completes when every partition has been sampled or skipped.</returns>
     internal async Task SampleOnceAsync(CancellationToken ct)
     {
-        var db = this.redis.GetDatabase();
+        var fallback = this.redis.GetDatabase();
 
         foreach (var monitor in StreamLag.All)
         {
             ct.ThrowIfCancellationRequested();
+
+            // Each partition on its topic's own server; see StreamPartitionMonitor.Connection.
+            var db = monitor.Connection is { } own ? own.GetDatabase() : fallback;
 
             try
             {

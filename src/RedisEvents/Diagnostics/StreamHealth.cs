@@ -240,7 +240,7 @@ public static class StreamHealth
     {
         ArgumentNullException.ThrowIfNull(services);
 
-        return Evaluate(services.GetService<StreamsConnectionProvider>(), services.GetServices<IHostedService>());
+        return Evaluate(Connections(services), services.GetServices<IHostedService>());
     }
 
     /// <summary>
@@ -561,6 +561,32 @@ public static class StreamHealth
     internal static StreamHealthReport Evaluate(
         StreamsConnectionProvider? connection,
         IEnumerable<IHostedService>? hostedServices)
+        => Evaluate(connection is null ? null : [connection], hostedServices);
+
+    /// <summary>
+    /// Every streams connection the container's process uses: each distinct server a topic has been
+    /// resolved to, plus the default. Falls back to the default provider alone when no registry is
+    /// registered.
+    /// </summary>
+    /// <param name="services">The host's service provider.</param>
+    /// <returns>The connections to check, or <see langword="null"/> when there are none.</returns>
+    internal static IReadOnlyList<StreamsConnectionProvider>? Connections(IServiceProvider services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+
+        if (services.GetService<StreamsConnectionRegistry>() is { } registry)
+            return registry.InUse;
+
+        return services.GetService<StreamsConnectionProvider>() is { } single ? [single] : null;
+    }
+
+    /// <summary>
+    /// <see cref="Evaluate(StreamsConnectionProvider?, IEnumerable{IHostedService}?)"/> over every
+    /// connection in use: the process is only as connected as its least connected server.
+    /// </summary>
+    internal static StreamHealthReport Evaluate(
+        IReadOnlyList<StreamsConnectionProvider>? connections,
+        IEnumerable<IHostedService>? hostedServices)
     {
         // StreamConsumerHost.IsRunning is "StartAsync ran and StopAsync has not" — it says nothing
         // about whether anything is being read, which is why it is counted as "started" here and the
@@ -585,7 +611,7 @@ public static class StreamHealth
 
         var context = new StreamHealthContext
         {
-            ConnectionFault = ConnectionFault(connection),
+            ConnectionFault = ConnectionFault(connections),
             Consumers = consumers,
             ConsumersStarted = started,
             OwnershipDegraded = OwnershipRegistry.AnyDegraded(),
@@ -598,6 +624,26 @@ public static class StreamHealth
     /// Whether the shared multiplexer is unusable. Resolving it here is safe: it is created once and
     /// cached, and a connect failure is itself the answer the check is looking for.
     /// </summary>
+    private static string? ConnectionFault(IReadOnlyList<StreamsConnectionProvider>? connections)
+    {
+        if (connections is null)
+        {
+            return null;
+        }
+
+        List<string>? faults = null;
+
+        foreach (var connection in connections)
+        {
+            if (ConnectionFault(connection) is { } fault)
+            {
+                (faults ??= []).Add(fault);
+            }
+        }
+
+        return faults is null ? null : string.Join("; ", faults);
+    }
+
     private static string? ConnectionFault(StreamsConnectionProvider? connection)
     {
         if (connection is null)

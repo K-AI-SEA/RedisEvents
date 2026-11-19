@@ -54,7 +54,7 @@ public readonly record struct ForwardedMessage(string PartitionKey, ReadOnlyMemo
 /// <c>"{topic}:{partition}"</c>). Several sources may forward onto one target; each keeps its own mark.
 /// </para>
 /// <code>
-/// var forwarder = new TopicForwarder(sharedDb, "transactions", streamOptions);
+/// var forwarder = new TopicForwarder(StreamsConnection.GetTopicDatabase(services, "transactions"), "transactions", streamOptions);
 ///
 /// // in a projection handler for the source topic:
 /// await forwarder.ForwardAsync(
@@ -71,7 +71,10 @@ public sealed class TopicForwarder
     private readonly TopicOptions? topicOptions;
 
     /// <summary>Creates a forwarder onto <paramref name="targetTopic"/>.</summary>
-    /// <param name="database">A database on the <b>shared</b> streams multiplexer — the forward is an outbox transaction; see <see cref="Outbox"/>.</param>
+    /// <param name="database">
+    /// A database on the <b>shared</b> streams multiplexer of the target topic's server — the forward is an
+    /// outbox transaction; see <see cref="Outbox"/>. A database on another server throws.
+    /// </param>
     /// <param name="targetTopic">The topic every forward publishes to.</param>
     /// <param name="streamOptions">The configured streams, for the target topic's partitioning and trimming.</param>
     /// <param name="name">
@@ -90,6 +93,11 @@ public sealed class TopicForwarder
         this.database = database;
         this.TargetTopic = targetTopic;
         this.topicOptions = streamOptions.Topics.GetValueOrDefault(targetTopic);
+
+        // Every forward is an outbox transaction on the target topic, so a database on another server
+        // is refused now, at construction, rather than on the first event.
+        if (this.topicOptions is not null)
+            Outbox.RequireTopicServer(database, targetTopic, this.topicOptions);
         this.highWaterKey = Outbox.StateKey(targetTopic, $"{name}:high-water");
         this.MarkerTtl = markerTtl ?? DefaultMarkerTtl;
     }

@@ -19,6 +19,17 @@ public sealed record StreamOptions
     public string? ConnectionString { get; set; }
 
     /// <summary>
+    /// Named connection strings, for a process whose topics live on more than one Redis server.
+    /// A topic picks one with <see cref="TopicOptions.Connection"/>; a topic that names none stays on
+    /// <see cref="ConnectionString"/>. Empty (the default) is single-server mode, exactly as before.
+    /// </summary>
+    /// <remarks>
+    /// Names that resolve to the same server share one multiplexer, so pointing every name at one
+    /// Redis costs no extra connections. See the README, "Several Redis servers".
+    /// </remarks>
+    public Dictionary<string, string> Connections { get; set; } = [];
+
+    /// <summary>
     /// Default consumer group name for all consumers (can be overridden per consumer).
     /// Defaults to the service/assembly name if not specified.
     /// </summary>

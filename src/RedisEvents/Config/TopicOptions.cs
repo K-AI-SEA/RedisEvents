@@ -109,4 +109,23 @@ public sealed record TopicOptions
     /// Used to prevent a stuck consumer from holding up trimming and filling the stream.
     /// </summary>
     public double ClampReleaseThreshold { get; set; } = 0.8;
+
+    /// <summary>
+    /// The name of the <see cref="StreamOptions.Connections"/> entry this topic lives on, or
+    /// <see langword="null"/> (the default) for <see cref="StreamOptions.ConnectionString"/>.
+    /// </summary>
+    /// <remarks>
+    /// Every key the library keeps for the topic follows it: the partition streams, consumer
+    /// positions, ownership, reset markers, topic metadata and the state and dedupe keys of an outbox
+    /// or event store. An unknown name fails at startup.
+    /// </remarks>
+    public string? Connection { get; set; }
+
+    /// <summary>
+    /// The connection string this topic resolves to, stamped when the options are validated and
+    /// <see cref="StreamOptions.Connections"/> is in use; <see langword="null"/> in single-server
+    /// mode. The outbox compares a database's endpoint against it, so a transaction can never write a
+    /// topic's keys onto another server. Internal: not a configuration key.
+    /// </summary>
+    internal string? ResolvedConnectionString { get; set; }
 }

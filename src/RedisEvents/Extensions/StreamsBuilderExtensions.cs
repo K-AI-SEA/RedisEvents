@@ -700,10 +700,12 @@ public static class StreamsBuilderExtensions
             return builder;
 
         // Implicitly-typed (sp, _): the keyed-factory key differs in nullability by TFM — see AddStreamPublisher.
+        // On the topic's own connection: the state streams and the publish share one MULTI/EXEC,
+        // so both must be on the server the topic lives on.
         builder.Services.AddKeyedSingleton<IStreamStore>(
             topic,
             (sp, _) => new StreamStore(
-                sp.GetRequiredService<StreamsConnectionProvider>().Connection.GetDatabase(),
+                StreamsConnectionRegistry.ForTopic(sp, topic).Connection.GetDatabase(),
                 topic,
                 topicOptions));
 
@@ -809,11 +811,12 @@ public static class StreamsBuilderExtensions
     }
 
     /// <summary>
-    /// Builds a direct publisher on the <b>shared</b> multiplexer. Writes never go through a
-    /// consumer's dedicated reader connection, which may be parked in a blocking <c>XREAD</c>.
+    /// Builds a direct publisher on the topic's <b>shared</b> multiplexer — the default one, or the
+    /// one for the topic's named connection. Writes never go through a consumer's dedicated reader
+    /// connection, which may be parked in a blocking <c>XREAD</c>.
     /// </summary>
     private static StreamPublisher CreateDirect(IServiceProvider services, string topic, TopicOptions topicOptions) =>
-        new(services.GetRequiredService<StreamsConnectionProvider>().Connection.GetDatabase(), topic, topicOptions);
+        new(StreamsConnectionRegistry.ForTopic(services, topic).Connection.GetDatabase(), topic, topicOptions);
 
     private static IHostApplicationBuilder Register(
         IHostApplicationBuilder builder,
@@ -875,6 +878,15 @@ public static class StreamsBuilderExtensions
             sp.GetService<ILoggerFactory>()?.CreateLogger("RedisEvents"),
             sp.GetService<IRedisTracingApplier>() ?? NoOpRedisTracingApplier.Instance));
 
+        // Every connection the process uses, and which topic lives on which. With no
+        // Streams:Connections it holds the provider above alone, so single-server mode is unchanged.
+        builder.Services.AddSingleton(sp => new StreamsConnectionRegistry(
+            options,
+            sp.GetRequiredService<StreamsConnectionProvider>(),
+            sp,
+            sp.GetService<ILoggerFactory>()?.CreateLogger("RedisEvents"),
+            sp.GetService<IRedisTracingApplier>() ?? NoOpRedisTracingApplier.Instance));
+
         // Registered first, so its advisory lines land above the consumer hosts' startup logs.
         builder.Services.AddSingleton<IHostedService>(sp => new StreamsConfigurationAdvisor(
             options,
@@ -903,7 +915,7 @@ public static class StreamsBuilderExtensions
         {
             builder.Services.AddSingleton<IHostedService>(sp => new BackgroundTrimmer(
                 options,
-                sp.GetRequiredService<StreamsConnectionProvider>(),
+                sp.GetRequiredService<StreamsConnectionRegistry>(),
                 sp.GetService<ILoggerFactory>()?.CreateLogger("RedisEvents.Trimming")));
         }
 

@@ -170,7 +170,8 @@ internal sealed class BackgroundTrimmer : IHostedService, IAsyncDisposable
     private const long LengthNotRead = -1;
 
     private readonly StreamOptions options;
-    private readonly Func<IConnectionMultiplexer> resolve;
+    /// <summary>Topic to the multiplexer of the server it lives on; the clamp scan runs there too.</summary>
+    private readonly Func<string, IConnectionMultiplexer> resolve;
     private readonly ILogger log;
     private readonly string[] topics;
 
@@ -199,6 +200,19 @@ internal sealed class BackgroundTrimmer : IHostedService, IAsyncDisposable
     }
 
     /// <summary>
+    /// Creates a trimmer that sweeps each topic on the server it lives on, resolving connections
+    /// lazily. A topic's <c>p:</c> position keys live beside its streams, so the clamp scan runs on the
+    /// same connection as the trim.
+    /// </summary>
+    /// <param name="options">The bound root options; every topic with a background trim interval is swept.</param>
+    /// <param name="connections">Every streams connection, and which topic lives on which.</param>
+    /// <param name="logger">Logger for the held-back Warning and the release Error.</param>
+    internal BackgroundTrimmer(StreamOptions options, StreamsConnectionRegistry connections, ILogger? logger = null)
+        : this(options, ResolverFor(connections), logger)
+    {
+    }
+
+    /// <summary>
     /// Creates a trimmer over an existing multiplexer.
     /// </summary>
     /// <param name="options">The bound root options; every topic with a background trim interval is swept.</param>
@@ -209,7 +223,7 @@ internal sealed class BackgroundTrimmer : IHostedService, IAsyncDisposable
     {
     }
 
-    private BackgroundTrimmer(StreamOptions options, Func<IConnectionMultiplexer> resolve, ILogger? logger)
+    private BackgroundTrimmer(StreamOptions options, Func<string, IConnectionMultiplexer> resolve, ILogger? logger)
     {
         ArgumentNullException.ThrowIfNull(options);
 
@@ -359,16 +373,22 @@ internal sealed class BackgroundTrimmer : IHostedService, IAsyncDisposable
         return this.TrimAsync(topic, topicOptions, ct);
     }
 
-    private static Func<IConnectionMultiplexer> ResolverFor(StreamsConnectionProvider connection)
+    private static Func<string, IConnectionMultiplexer> ResolverFor(StreamsConnectionProvider connection)
     {
         ArgumentNullException.ThrowIfNull(connection);
-        return () => connection.Connection;
+        return _ => connection.Connection;
     }
 
-    private static Func<IConnectionMultiplexer> ResolverFor(IConnectionMultiplexer redis)
+    private static Func<string, IConnectionMultiplexer> ResolverFor(StreamsConnectionRegistry connections)
+    {
+        ArgumentNullException.ThrowIfNull(connections);
+        return topic => connections.ForTopic(topic).Connection;
+    }
+
+    private static Func<string, IConnectionMultiplexer> ResolverFor(IConnectionMultiplexer redis)
     {
         ArgumentNullException.ThrowIfNull(redis);
-        return () => redis;
+        return _ => redis;
     }
 
     private static string[] EnabledTopics(StreamOptions options)
@@ -459,7 +479,7 @@ internal sealed class BackgroundTrimmer : IHostedService, IAsyncDisposable
         var cutoffUtc = CutoffFor(topicOptions, now);
         var cutoff = StreamId.FromDate(cutoffUtc);
 
-        var redis = this.resolve();
+        var redis = this.resolve(topic);
         var db = redis.GetDatabase();
 
         // One scan for the whole topic: every consumer's positions, keyed by consumer name.

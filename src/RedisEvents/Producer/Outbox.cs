@@ -57,11 +57,15 @@ public readonly record struct OutboxPublish(
 /// <see cref="Idempotency.TryBeginAsync"/> is there for the ones that are not naturally so.
 /// </para>
 /// <para>
-/// <b>Always non-buffered, always on the shared multiplexer.</b> A buffered publish would defeat the
+/// <b>Always non-buffered, always on the topic's server.</b> A buffered publish would defeat the
 /// atomicity, so buffering cannot be passed in. A <c>MULTI</c>/<c>EXEC</c> is bound to a single
-/// connection and cannot span two multiplexers, so the database must come from the shared streams
-/// multiplexer: a consumer's dedicated reader connection is read-only and may be parked in a
-/// blocking <c>XREAD</c>. See <see cref="Extensions.StreamsConnectionProvider"/>.
+/// connection and cannot span two servers, so the database must be a shared streams database on the
+/// server the topic lives on: <see cref="Extensions.StreamsConnection.GetTopicDatabase"/>, or
+/// <see cref="Extensions.StreamsConnection.GetSharedDatabase"/> when the topic is on the default
+/// connection. A consumer's dedicated reader connection is refused (it is read-only and may be parked
+/// in a blocking <c>XREAD</c>), and when <see cref="StreamOptions.Connections"/> is in use a database
+/// on any other server is refused too. That check compares endpoints, not names, so several
+/// connection names on one Redis share transactions freely.
 /// </para>
 /// <para>
 /// <b>Same slot.</b> In a Redis Cluster every key in a transaction must hash to one slot. Stream keys
@@ -185,6 +189,7 @@ public static class Outbox
 
         RequireSharedMultiplexer(db);
         var effective = Validate(topic, topicOptions);
+        RequireTopicServer(db, topic, effective);
 
         var partition = Route(topic, partitionKey, options.Partition, effective.Partitions);
         var streamKey = StreamKeys.Stream(topic, partition, effective.CoLocatePartitions);
@@ -269,6 +274,7 @@ public static class Outbox
             }
 
             var effective = Validate(publish.Topic, publish.TopicOptions);
+            RequireTopicServer(db, publish.Topic, effective);
             topicOptions[i] = effective;
             partitions[i] = Route(publish.Topic, publish.PartitionKey, publish.Options.Partition, effective.Partitions);
             keys[i] = StreamKeys.Stream(publish.Topic, partitions[i], effective.CoLocatePartitions);
@@ -584,6 +590,38 @@ public static class Outbox
                 "A MULTI/EXEC is bound to one connection, so the outbox must run on the shared streams multiplexer — " +
                 "take it from StreamsConnectionProvider.Connection.");
         }
+    }
+
+    /// <summary>
+    /// Rejects a database on a server the topic does not live on. A <c>MULTI</c>/<c>EXEC</c> is
+    /// atomic on one server only; queued through another server's database, the topic's stream and
+    /// state keys would be written where no consumer, trimmer or event store ever looks, and nothing
+    /// would fail. Compared by endpoint, never by connection name or multiplexer: a database from
+    /// any multiplexer to the topic's server is accepted, which is what keeps one Redis serving every
+    /// connection name a supported deployment.
+    /// </summary>
+    /// <remarks>
+    /// Only checked when the topic's options carry a resolved connection — that is, when they came
+    /// from a validated <see cref="StreamOptions"/> that uses <see cref="StreamOptions.Connections"/>.
+    /// In single-server mode, or for options built by hand, nothing is compared, as before.
+    /// </remarks>
+    internal static void RequireTopicServer(IDatabase db, string topic, TopicOptions effective)
+    {
+        if (effective.ResolvedConnectionString is not { } expected)
+            return;
+
+        if (Extensions.RedisServerIdentity.SameServer(db.Multiplexer, expected))
+            return;
+
+        var have = string.Join(",", db.Multiplexer.GetEndPoints().Select(e => e.ToString()));
+        var want = string.Join(",", Extensions.RedisServerIdentity.Written(expected));
+
+        throw new StreamConfigurationException(
+            $"Outbox: topic '{topic}' lives on {want}" +
+            (effective.Connection is { Length: > 0 } name ? $" (connection '{name}')" : " (the default connection)") +
+            $", but this database is on {have}. A MULTI/EXEC is atomic on one server only, so the state and the publish must " +
+            "both go through the topic's server: take the database from StreamsConnection.GetTopicDatabase(services, topic), " +
+            "or keep the state on the topic's store.");
     }
 
     /// <summary>Rejects a topic name whose braces would corrupt the hash tag in <c>s:{topic}:&lt;p&gt;</c>.</summary>

@@ -8,6 +8,7 @@ using Microsoft.Extensions.Logging;
 using RedisEvents.Admin;
 using RedisEvents.Config;
 using RedisEvents.Errors;
+using RedisEvents.Extensions;
 using RedisEvents.Wire;
 using StackExchange.Redis;
 
@@ -151,13 +152,35 @@ public static class StreamAdminEndpoints
     /// <remarks>
     /// Use this when the multiplexer is registered in DI: routes can then be mapped before it is
     /// resolvable, and a service that never receives an admin request never forces the connection.
+    /// A topic that names a <c>Streams:Connections</c> entry is administered on that connection's
+    /// server instead, where its positions and ownership live.
     /// A request that arrives with no registration answers 500 saying exactly that.
     /// </remarks>
     public static void MapRoutes(IEndpointRouteBuilder group, StreamAdminEndpointOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(group);
 
-        Map(group, static ctx => ctx.RequestServices?.GetService(typeof(IConnectionMultiplexer)) as IConnectionMultiplexer, options ?? Defaults);
+        Map(group, static ctx => TopicConnection(ctx) ?? ctx.RequestServices?.GetService(typeof(IConnectionMultiplexer)) as IConnectionMultiplexer, options ?? Defaults);
+    }
+
+    /// <summary>
+    /// The multiplexer of the server the route's topic lives on, when the topic names a
+    /// <c>Streams:Connections</c> entry; <see langword="null"/> otherwise, which keeps the
+    /// single-server resolution exactly as it was.
+    /// </summary>
+    private static IConnectionMultiplexer? TopicConnection(HttpContext ctx)
+    {
+        if (ctx.Request.RouteValues.TryGetValue("topic", out var value) is false
+            || value is not string topic
+            || string.IsNullOrWhiteSpace(topic)
+            || ctx.RequestServices?.GetService(typeof(StreamOptions)) is not StreamOptions streams
+            || StreamConfigBinder.NamedConnectionOf(streams, topic) is null
+            || ctx.RequestServices.GetService(typeof(StreamsConnectionRegistry)) is not StreamsConnectionRegistry registry)
+        {
+            return null;
+        }
+
+        return registry.ForTopic(topic).Connection;
     }
 
     private static void Map(
