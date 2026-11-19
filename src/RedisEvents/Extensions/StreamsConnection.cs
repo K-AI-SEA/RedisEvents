@@ -11,7 +11,8 @@ using StackExchange.Redis;
 namespace RedisEvents.Extensions;
 
 /// <summary>
-/// The shared streams connection, for code that has to speak to the same Redis the library does.
+/// The shared streams connections, for code that has to speak to the same Redis the library does:
+/// the default one (<see cref="GetSharedDatabase"/>) or a topic's (<see cref="GetTopicDatabase"/>).
 /// </summary>
 /// <remarks>
 /// <para>
@@ -31,8 +32,14 @@ namespace RedisEvents.Extensions;
 public static class StreamsConnection
 {
     /// <summary>
-    /// The shared streams <see cref="IDatabase"/>, connecting on first use.
+    /// The shared streams <see cref="IDatabase"/> of the default connection
+    /// (<c>Streams:ConnectionString</c>), connecting on first use.
     /// </summary>
+    /// <remarks>
+    /// This is the service's own server — where its views and other keys of its own belong. A topic
+    /// that names a <c>Streams:Connections</c> entry may live elsewhere; use
+    /// <see cref="GetTopicDatabase"/> for anything that writes a topic's keys.
+    /// </remarks>
     /// <param name="services">A built container that has had an <c>AddStream…</c> call on its builder.</param>
     /// <returns>A database handle on the shared streams multiplexer.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="services"/> is null.</exception>
@@ -49,6 +56,38 @@ public static class StreamsConnection
                 "make one before asking for the connection.");
 
         return provider.Connection.GetDatabase();
+    }
+
+    /// <summary>
+    /// The shared streams <see cref="IDatabase"/> on the server <paramref name="topic"/> lives on —
+    /// its <c>Streams:Topics:&lt;topic&gt;:Connection</c>, or the default connection when it names none.
+    /// Connects on first use.
+    /// </summary>
+    /// <param name="services">A built container that has had an <c>AddStream…</c> call on its builder.</param>
+    /// <param name="topic">The topic whose server is wanted.</param>
+    /// <returns>A database handle on that server's shared streams multiplexer.</returns>
+    /// <remarks>
+    /// Use it for anything that writes a topic's keys outside the library's own publishers and stores:
+    /// an <see cref="Producer.Outbox"/> transaction, a <see cref="Producer.TopicForwarder"/>, a
+    /// <see cref="Admin.StreamAdmin"/> call. In single-server mode it is the same database
+    /// <see cref="GetSharedDatabase"/> returns.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException"><paramref name="services"/> is null.</exception>
+    /// <exception cref="ArgumentException"><paramref name="topic"/> is null, empty or whitespace.</exception>
+    /// <exception cref="StreamConfigurationException">No <c>AddStream…</c> call was made, or the topic names a connection that is not configured.</exception>
+    /// <exception cref="StreamTransportException">The library's own connect attempt failed.</exception>
+    public static IDatabase GetTopicDatabase(IServiceProvider services, string topic)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentException.ThrowIfNullOrWhiteSpace(topic);
+
+        var registry = services.GetService<StreamsConnectionRegistry>()
+            ?? throw new StreamConfigurationException(
+                "Streams: the streams connections are not registered, so there is no database to hand out for topic " +
+                $"'{topic}'. They are registered by the first AddStream/AddStreamPublisher/AddStreamStore call on the host " +
+                "builder; make one before asking for a connection.");
+
+        return registry.ForTopic(topic).Connection.GetDatabase();
     }
 }
 
@@ -84,6 +123,7 @@ internal enum StreamsConnectionSource
 internal sealed class StreamsConnectionProvider : IAsyncDisposable, IDisposable
 {
     private readonly StreamOptions options;
+    private readonly string? connectionString;
     private readonly IServiceProvider? services;
     private readonly ILogger? logger;
     private readonly IRedisTracingApplier? tracingApplier;
@@ -113,6 +153,27 @@ internal sealed class StreamsConnectionProvider : IAsyncDisposable, IDisposable
     /// <param name="logger">Optional logger; the resolution path is logged at Information.</param>
     /// <param name="tracingApplier">Optional tracing applier for Redis operation tracing.</param>
     public StreamsConnectionProvider(StreamOptions options, IServiceProvider? services, ILogger? logger, IRedisTracingApplier? tracingApplier)
+        : this(options, services, logger, tracingApplier, name: null, connectionString: null)
+    {
+    }
+
+    /// <summary>
+    /// Creates a provider for one named entry of <see cref="StreamOptions.Connections"/>, resolving
+    /// lazily like the default one.
+    /// </summary>
+    /// <param name="options">The bound stream options.</param>
+    /// <param name="services">The container to look for an existing multiplexer in; may be <see langword="null"/>.</param>
+    /// <param name="logger">Optional logger; the resolution path is logged at Information.</param>
+    /// <param name="tracingApplier">Optional tracing applier for Redis operation tracing.</param>
+    /// <param name="name">The connection name, for logs; <see langword="null"/> for the default connection.</param>
+    /// <param name="connectionString">The connection string; <see langword="null"/> for <c>Streams:ConnectionString</c>.</param>
+    public StreamsConnectionProvider(
+        StreamOptions options,
+        IServiceProvider? services,
+        ILogger? logger,
+        IRedisTracingApplier? tracingApplier,
+        string? name,
+        string? connectionString)
     {
         ArgumentNullException.ThrowIfNull(options);
 
@@ -120,12 +181,25 @@ internal sealed class StreamsConnectionProvider : IAsyncDisposable, IDisposable
         this.services = services;
         this.logger = logger;
         this.tracingApplier = tracingApplier;
+        this.Name = name;
+        this.connectionString = connectionString;
     }
+
+    /// <summary>
+    /// The <see cref="StreamOptions.Connections"/> name this provider serves first, or
+    /// <see langword="null"/> for the default connection (<c>Streams:ConnectionString</c>).
+    /// </summary>
+    public string? Name { get; }
 
     /// <summary>
     /// The configured connection string, after defaulting.
     /// </summary>
-    public string ConnectionString => StreamConfigBinder.ResolveConnectionString(this.options);
+    public string ConnectionString => string.IsNullOrWhiteSpace(this.connectionString)
+        ? StreamConfigBinder.ResolveConnectionString(this.options)
+        : this.connectionString;
+
+    /// <summary>Whether <see cref="Connection"/> has been resolved, so asking about it costs no connect.</summary>
+    public bool IsResolved => Volatile.Read(ref this.connection) is not null;
 
     /// <summary>
     /// The tracing applier for Redis operation tracing, if configured.
@@ -164,7 +238,7 @@ internal sealed class StreamsConnectionProvider : IAsyncDisposable, IDisposable
                 if (this.connection is not null)
                     return this.connection;
 
-                this.connection = Resolve(this.services, this.options, this.logger, out var created, out this.configuration);
+                this.connection = Resolve(this.services, this.ConnectionString, this.ConfigSource(), this.logger, out var created, out this.configuration);
                 this.owned = created;
 
                 // Only a multiplexer the library created is ours to instrument. A reused one belongs
@@ -208,9 +282,30 @@ internal sealed class StreamsConnectionProvider : IAsyncDisposable, IDisposable
         out ConfigurationOptions? configuration)
     {
         ArgumentNullException.ThrowIfNull(options);
+        return Resolve(services, StreamConfigBinder.ResolveConnectionString(options), DefaultSource(options), logger, out created, out configuration);
+    }
+
+    /// <summary>Where this provider's connection string came from, for the connect log line and errors.</summary>
+    private string ConfigSource() => this.Name is null
+        ? DefaultSource(this.options)
+        : $"{StreamConfigBinder.SectionName}:Connections:{this.Name}";
+
+    private static string DefaultSource(StreamOptions options) =>
+        string.IsNullOrWhiteSpace(options.ConnectionString) ? "default" : $"{StreamConfigBinder.SectionName}:ConnectionString";
+
+    /// <summary>
+    /// Reuse-or-connect for one connection string: the default connection's, or a named one's.
+    /// </summary>
+    private static IConnectionMultiplexer Resolve(
+        IServiceProvider? services,
+        string connectionString,
+        string source,
+        ILogger? logger,
+        out bool created,
+        out ConfigurationOptions? configuration)
+    {
         configuration = null;
 
-        var connectionString = StreamConfigBinder.ResolveConnectionString(options);
         var configured = ParseConfiguration(connectionString);
         var configuredEndpoint = DescribeEndpoints(configured.EndPoints);
 
@@ -244,7 +339,7 @@ internal sealed class StreamsConnectionProvider : IAsyncDisposable, IDisposable
             "Streams: connecting a dedicated streams multiplexer; endpoint={Endpoint} clientName={ClientName} source={Source}.",
             configuredEndpoint,
             clientName,
-            string.IsNullOrWhiteSpace(options.ConnectionString) ? "default" : $"{StreamConfigBinder.SectionName}:ConnectionString");
+            source);
 
         try
         {
@@ -256,7 +351,9 @@ internal sealed class StreamsConnectionProvider : IAsyncDisposable, IDisposable
         {
             throw new StreamTransportException(
                 $"Streams: failed to connect to Redis at '{configuredEndpoint}'. " +
-                $"Check {StreamConfigBinder.SectionName}:ConnectionString (default '{StreamConfigBinder.DefaultConnectionString}').",
+                (source.StartsWith($"{StreamConfigBinder.SectionName}:Connections:", StringComparison.Ordinal)
+                    ? $"Check {source}."
+                    : $"Check {StreamConfigBinder.SectionName}:ConnectionString (default '{StreamConfigBinder.DefaultConnectionString}')."),
                 ex);
         }
     }

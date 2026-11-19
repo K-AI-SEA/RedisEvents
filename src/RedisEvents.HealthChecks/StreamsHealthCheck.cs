@@ -59,7 +59,7 @@ namespace RedisEvents.HealthChecks;
 /// </remarks>
 public sealed class StreamsHealthCheck : IHealthCheck
 {
-    private readonly StreamsConnectionProvider? connection;
+    private readonly Func<IReadOnlyList<StreamsConnectionProvider>?> connections;
     private readonly IEnumerable<IHostedService>? hostedServices;
 
     /// <summary>
@@ -77,8 +77,25 @@ public sealed class StreamsHealthCheck : IHealthCheck
     internal StreamsHealthCheck(
         StreamsConnectionProvider? connection = null,
         IEnumerable<IHostedService>? hostedServices = null)
+        : this(() => connection is null ? null : [connection], hostedServices)
     {
-        this.connection = connection;
+    }
+
+    /// <summary>
+    /// Creates the check over several connections: every server the process's topics live on. The
+    /// process is unhealthy when any of them is down.
+    /// </summary>
+    /// <param name="connections">
+    /// Reads the connection providers to check, on every check, so a topic resolved after the check
+    /// was built is still covered; returning <see langword="null"/> checks none.
+    /// </param>
+    /// <param name="hostedServices">The container's hosted services; see the other constructor.</param>
+    internal StreamsHealthCheck(
+        Func<IReadOnlyList<StreamsConnectionProvider>?> connections,
+        IEnumerable<IHostedService>? hostedServices)
+    {
+        ArgumentNullException.ThrowIfNull(connections);
+        this.connections = connections;
         this.hostedServices = hostedServices;
     }
 
@@ -90,7 +107,7 @@ public sealed class StreamsHealthCheck : IHealthCheck
         HealthCheckContext context,
         CancellationToken cancellationToken = default)
     {
-        var report = StreamHealth.Evaluate(this.connection, this.hostedServices);
+        var report = StreamHealth.Evaluate(this.connections(), this.hostedServices);
 
         // Mapped by name, never by cast: HealthStatus counts down from Healthy = 2 and
         // StreamHealthStatus counts up from Healthy = 0.

@@ -295,6 +295,8 @@ Keys worth knowing, with their defaults:
 | Key | Default | What goes wrong |
 |---|---|---|
 | `ConnectionString` | `redis-db.infra:6379,abortConnect=false` | Point it at `redis-cache` and you lose everything on restart — see below |
+| `Connections:<name>` | none | Named connection strings for topics on other servers — see [Several Redis servers](#several-redis-servers) |
+| `Topics:<t>:Connection` | none (`ConnectionString`) | An unknown name is refused at startup |
 | `Consumer` | entry assembly name | Two services sharing a name share a position hash and each see half the messages |
 | `Topics:<t>:Partitions` | `1` | Can be increased, never decreased. Caps parallelism |
 | `Topics:<t>:MaxLen` | `10000` | Below worst-case consumer lag, trimming eats unprocessed messages |
@@ -344,6 +346,52 @@ group, and an admin reset of one leaves the other alone. Things to get right:
   reads them.
 - Background trimming of a topic clamps to every consumer's positions on it, whichever deployment it
   belongs to; turn `BackgroundTrimIntervalSeconds` on only in the deployment that owns the topic.
+
+### Several Redis servers
+
+One process can read and write topics that live on different Redis servers. Name the servers under
+`Streams:Connections` and give each topic the name of its server; a topic that names none stays on
+`Streams:ConnectionString`:
+
+```jsonc
+{
+  "Streams": {
+    "ConnectionString": "redis-db:6379",              // the service's own server: views, its own keys
+    "Connections": {
+      "core": "redis-db:6379",
+      "feed": "redis-db-feed:6379",
+      "bet": "redis-db-bet:6379"
+    },
+    "Topics": {
+      "feed-odds":  { "Connection": "feed", "Partitions": 2 },
+      "bet-placed": { "Connection": "bet" }
+    }
+  }
+}
+```
+
+**Everything the library keeps for a topic lives on the topic's server**: its partition streams and
+metadata, every consumer's positions, reset markers and ownership leases, a `WorkQueue` group, and the
+state and dedupe keys of an outbox, stream store or event store on it. A consumer reads, stores its
+position and claims its partitions there (in `Block` mode its dedicated reader dials that server too),
+so a position always sits beside the stream it tracks — which is what the trimmer's clamp relies on:
+it scans a topic's positions on the topic's own server. The lag sampler reads each partition's tail
+there as well, and the health check reports every server a topic of the process lives on.
+
+**What is not per topic stays on `ConnectionString`**: `StreamsConnection.GetSharedDatabase`,
+`AddRedisViewStore`, and so the service's views. A view belongs to the service, not to the topic it
+was projected from. For anything else that writes a topic's keys by hand — an outbox transaction, a
+`TopicForwarder`, a `StreamAdmin` call — take the database from
+`StreamsConnection.GetTopicDatabase(services, topic)`.
+
+**One server per name is a deployment choice, not a code path.** Names are grouped by server — the
+same endpoint as written, or host names that resolve to the same address — and each server gets one
+multiplexer. Point `core`, `feed` and `bet` at one Redis and the process opens exactly the connections
+it would with no `Connections` section, and writes exactly the same keys: key names never depend on
+placement, so a keyspace can be split across servers or merged back by moving keys, with no code
+change. Two names on one server must select the same database; a mismatch is refused at startup.
+
+With no `Connections` section nothing changes at all: every topic is on `ConnectionString`, as before.
 
 ---
 
@@ -512,9 +560,15 @@ Four things about it are load-bearing, and each has its own way of going wrong:
    anything is sent — otherwise a cluster deployment fails later with `CROSSSLOT`. Where the state
    genuinely cannot share a slot, take the escape hatch: write the state, then publish, and make the
    consumer idempotent.
-4. **The shared multiplexer only.** A transaction is bound to one connection, and a consumer's
-   dedicated reader connection is read-only and may be parked in a blocking `XREAD`. Passing one is
-   refused.
+4. **The topic's server, through a shared multiplexer.** A transaction is bound to one connection on
+   one server, and a consumer's dedicated reader connection is read-only and may be parked in a
+   blocking `XREAD`; passing one is refused. With [several servers](#several-redis-servers), the
+   database must also be on the server the topic lives on — `StreamsConnection.GetTopicDatabase` —
+   or the state and the stream entry would land where no consumer or event store of the topic looks.
+   A database on any other server is refused before anything is sent. The check compares endpoints,
+   not connection names, so several names on one Redis share a transaction freely. It needs the
+   topic's `TopicOptions` from the bound `StreamOptions` (pass `topicOptions`); options built by
+   hand, or single-server mode, are not checked.
 
 Optimistic concurrency needs no Lua: `conditions` map straight onto `WATCH`.
 
@@ -653,8 +707,8 @@ remember.
 `redis-cache` runs with `--save "" --appendonly no`, so a pod restart loses **every stream and every
 stored position** — messages that were never consumed, and the record of what was. Not "the cache is
 cold": the data is gone and consumers restart from the beginning of an empty stream. The default
-connection string points at `redis-db.infra:6379` for exactly this reason; overriding it is the only
-way to get this wrong.
+connection string points at `redis-db.infra:6379` for exactly this reason; overriding it, or naming a
+cache in `Streams:Connections`, is the only way to get this wrong.
 
 ### The batch is borrowed memory
 

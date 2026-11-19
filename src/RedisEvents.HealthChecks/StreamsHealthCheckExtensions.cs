@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Hosting;
+using RedisEvents.Diagnostics;
 using RedisEvents.Extensions;
 
 namespace RedisEvents.HealthChecks;
@@ -63,7 +64,7 @@ public static class StreamsHealthCheckExtensions
         services.AddHealthChecks().Add(new HealthCheckRegistration(
             StreamsHealthCheck.Name,
             sp => new StreamsHealthCheck(
-                sp.GetService<StreamsConnectionProvider>(),
+                () => StreamHealth.Connections(sp),
                 sp.GetServices<IHostedService>()),
             failureStatus: null,
             tags: [StreamsHealthCheck.Name]));

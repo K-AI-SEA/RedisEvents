@@ -144,6 +144,7 @@ internal static class StreamConfigBinder
         var isDevelopment = string.Equals(environment, DevelopmentEnvironmentName, StringComparison.OrdinalIgnoreCase);
 
         ValidateTopics(options, isDevelopment, environment);
+        ValidateConnections(options);
         // Bind already migrated it silently; this is the call that actually warns, because this is
         // the one with a logger. Options built in code rather than bound get their migration here.
         MigrateLegacyDeliveryKey(options, logger);
@@ -210,6 +211,69 @@ internal static class StreamConfigBinder
     {
         ArgumentNullException.ThrowIfNull(options);
         return string.IsNullOrWhiteSpace(options.ConnectionString) ? DefaultConnectionString : options.ConnectionString;
+    }
+
+    /// <summary>
+    /// Resolves the connection string a topic lives on: its <see cref="TopicOptions.Connection"/>
+    /// entry in <see cref="StreamOptions.Connections"/> when it names one, otherwise
+    /// <see cref="ResolveConnectionString(StreamOptions)"/>.
+    /// </summary>
+    /// <param name="options">The root options.</param>
+    /// <param name="topic">The topic name.</param>
+    /// <returns>The connection string to use for every key of the topic.</returns>
+    /// <exception cref="StreamConfigurationException">The topic names a connection that is not configured.</exception>
+    public static string ResolveConnectionString(StreamOptions options, string topic)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentException.ThrowIfNullOrWhiteSpace(topic);
+
+        var name = NamedConnectionOf(options, topic);
+        return name is null ? ResolveConnectionString(options) : NamedConnectionString(options, name);
+    }
+
+    /// <summary>
+    /// The <see cref="StreamOptions.Connections"/> entry a topic names, or <see langword="null"/> when
+    /// it names none (or is not configured at all) and so lives on the default connection.
+    /// </summary>
+    /// <param name="options">The root options.</param>
+    /// <param name="topic">The topic name.</param>
+    /// <returns>The connection name as configured on the topic, or <see langword="null"/>.</returns>
+    public static string? NamedConnectionOf(StreamOptions options, string topic)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+
+        return options.Topics.TryGetValue(topic, out var configured)
+            && configured is not null
+            && !string.IsNullOrWhiteSpace(configured.Connection)
+                ? configured.Connection
+                : null;
+    }
+
+    /// <summary>
+    /// Looks a connection name up in <see cref="StreamOptions.Connections"/>, case-insensitively as
+    /// configuration keys are.
+    /// </summary>
+    /// <param name="options">The root options.</param>
+    /// <param name="name">The connection name.</param>
+    /// <returns>The connection string.</returns>
+    /// <exception cref="StreamConfigurationException">No such connection is configured.</exception>
+    public static string NamedConnectionString(StreamOptions options, string name)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+
+        foreach (var (candidate, connectionString) in options.Connections)
+        {
+            if (string.Equals(candidate, name, StringComparison.OrdinalIgnoreCase))
+                return connectionString;
+        }
+
+        var known = options.Connections.Count == 0
+            ? $"{SectionName}:Connections is empty"
+            : $"the configured names are {string.Join(", ", options.Connections.Keys.Order(StringComparer.Ordinal))}";
+
+        throw new StreamConfigurationException(
+            $"Streams: connection '{name}' is not configured ({known}). Add {SectionName}:Connections:{name}, or correct the name.");
     }
 
     /// <summary>
@@ -281,6 +345,64 @@ internal static class StreamConfigBinder
                 throw new StreamConfigurationException(
                     $"{key}:Trim is None in environment '{environment}'. Trim=None is an OOM footgun and is only allowed in Development.");
             }
+        }
+    }
+
+    /// <summary>
+    /// Checks <see cref="StreamOptions.Connections"/> and every topic's
+    /// <see cref="TopicOptions.Connection"/>, then stamps each configured topic with the connection
+    /// string it resolves to so the outbox can guard against a write through another server. With no
+    /// named connections nothing is stamped: single-server mode is unchanged.
+    /// </summary>
+    private static void ValidateConnections(StreamOptions options)
+    {
+        options.Connections ??= [];
+
+        foreach (var (name, connectionString) in options.Connections)
+        {
+            var key = $"{SectionName}:Connections:{name}";
+
+            if (string.IsNullOrWhiteSpace(name))
+                throw new StreamConfigurationException($"{SectionName}:Connections has an entry with an empty name.");
+
+            if (string.IsNullOrWhiteSpace(connectionString))
+                throw new StreamConfigurationException($"{key} is empty. Give it a Redis connection string or remove it.");
+
+            try
+            {
+                if (ConfigurationOptions.Parse(connectionString).EndPoints.Count == 0)
+                    throw new StreamConfigurationException($"{key} ('{connectionString}') names no endpoint.");
+            }
+            catch (Exception ex) when (ex is not StreamConfigurationException)
+            {
+                throw new StreamConfigurationException(
+                    $"{key} is not a valid Redis connection string ('{connectionString}'): {ex.Message}",
+                    ex);
+            }
+        }
+
+        foreach (var (topicName, topic) in options.Topics)
+        {
+            if (topic is null)
+                continue;
+
+            if (!string.IsNullOrWhiteSpace(topic.Connection))
+            {
+                try
+                {
+                    _ = NamedConnectionString(options, topic.Connection);
+                }
+                catch (StreamConfigurationException ex)
+                {
+                    throw new StreamConfigurationException(
+                        $"{SectionName}:Topics:{topicName}:Connection is '{topic.Connection}', which is not configured. {ex.Message}",
+                        ex);
+                }
+            }
+
+            topic.ResolvedConnectionString = options.Connections.Count == 0
+                ? null
+                : ResolveConnectionString(options, topicName);
         }
     }
 
@@ -359,12 +481,19 @@ internal static class StreamConfigBinder
             if (consumer.ReadMode != ReadMode.Block)
                 continue;
 
-            if (consumer.BlockMs >= syncTimeoutMs)
+            // A topic on a named connection is read over that connection, so its timeout is the one that counts.
+            var connectionName = NamedConnectionOf(options, consumer.Topic);
+            var effectiveSyncTimeoutMs = connectionName is null
+                ? syncTimeoutMs
+                : ResolveSyncTimeoutMs(ResolveConnectionString(options, consumer.Topic));
+            var connectionKey = connectionName is null ? $"{SectionName}:ConnectionString" : $"{SectionName}:Connections:{connectionName}";
+
+            if (consumer.BlockMs >= effectiveSyncTimeoutMs)
             {
                 throw new StreamConfigurationException(
-                    $"{key}:BlockMs is {consumer.BlockMs}ms but the resolved connection's syncTimeout is {syncTimeoutMs}ms. " +
+                    $"{key}:BlockMs is {consumer.BlockMs}ms but the resolved connection's syncTimeout is {effectiveSyncTimeoutMs}ms. " +
                     "In Block mode BlockMs must stay well under syncTimeout, otherwise StackExchange.Redis times the XREAD out client-side. " +
-                    $"Lower {key}:BlockMs or raise syncTimeout in {SectionName}:ConnectionString.");
+                    $"Lower {key}:BlockMs or raise syncTimeout in {connectionKey}.");
             }
 
             if (!topic.CoLocatePartitions && topic.Partitions > 2)

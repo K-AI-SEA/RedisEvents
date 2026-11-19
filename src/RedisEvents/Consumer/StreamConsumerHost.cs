@@ -162,8 +162,9 @@ internal sealed class StreamConsumerHost : IHostedService, IAsyncDisposable
     /// see the remarks on the class.
     /// </param>
     /// <param name="connection">
-    /// The shared multiplexer provider. Writes, positions, admin and <see cref="ReadMode.Poll"/>
-    /// reads all run on it; a blocking reader gets its own connection instead.
+    /// The shared multiplexer provider of the server the topic lives on (the default connection, or
+    /// the topic's named one). Writes, positions, admin and <see cref="ReadMode.Poll"/> reads all run
+    /// on it; a blocking reader gets its own connection to the same server instead.
     /// </param>
     /// <param name="logger">Logger for the ownership map, the drain and every failure.</param>
     /// <param name="lifetime">
@@ -269,7 +270,10 @@ internal sealed class StreamConsumerHost : IHostedService, IAsyncDisposable
             registration.Options,
             registration.Consumer,
             ResolveHandler(registration, services),
-            services.GetRequiredService<StreamsConnectionProvider>(),
+
+            // The topic's connection, not the process default: the streams, the positions, the reset
+            // markers, ownership and the blocking reader all live on the server the topic does.
+            StreamsConnectionRegistry.ForTopic(services, registration.Options.Topic),
             logger,
 
             // GetService, not GetRequiredService: the lifetime is always there under the generic
@@ -611,7 +615,8 @@ internal sealed class StreamConsumerHost : IHostedService, IAsyncDisposable
 
                 this.reader = await StreamReaderConnection
                     .CreateAsync(
-                        this.options,
+                        // The reader dials this host's connection, which is the topic's.
+                        this.options with { ConnectionString = this.connection.ConnectionString },
                         this.consumer,
                         this.consumerName,
                         index: 0,
@@ -1136,6 +1141,7 @@ internal sealed class StreamConsumerHost : IHostedService, IAsyncDisposable
                 degradedSilenceSeconds: this.consumer.DegradedSilenceSeconds,
                 unhealthyStalledSeconds: this.consumer.UnhealthyStalledSeconds);
 
+            monitor.Connection = this.connection.Connection;
             this.monitors.Add(monitor);
 
             contexts[i] = new PartitionContext(
@@ -1317,6 +1323,7 @@ internal sealed class StreamConsumerHost : IHostedService, IAsyncDisposable
                 degradedSilenceSeconds: this.consumer.DegradedSilenceSeconds,
                 unhealthyStalledSeconds: this.consumer.UnhealthyStalledSeconds);
 
+            monitor.Connection = this.connection.Connection;
             this.monitors.Add(monitor);
 
             // Writer: null — inline mode has no channel; ReadGroupInlineLoopAsync calls the handler
@@ -1540,6 +1547,8 @@ internal sealed class StreamConsumerHost : IHostedService, IAsyncDisposable
             degradedSilenceSeconds: useGroup ? 0 : this.consumer.DegradedSilenceSeconds,
             unhealthyStalledSeconds: this.consumer.UnhealthyStalledSeconds);
 
+        // Sampled over the topic's own connection, which need not be the one the sampler started on.
+        monitor.Connection = this.connection.Connection;
         this.monitors.Add(monitor);
 
         var ctx = new PartitionContext(
@@ -1833,9 +1842,10 @@ internal sealed class StreamConsumerHost : IHostedService, IAsyncDisposable
     /// One sampler per process, not per host: it walks <see cref="StreamLag.All"/>, which is every
     /// monitor in the process, so a second one would double the <c>XINFO STREAM</c> traffic and push
     /// the same gauge values twice. Reference counted so that a service hosting several consumers
-    /// keeps sampling until the last of them stops. The first host in wins the multiplexer, which is
-    /// exactly right while every consumer resolves its connection from the one
-    /// <see cref="StreamsConnectionProvider"/> in the container — the shape <c>AddStream</c> builds.
+    /// keeps sampling until the last of them stops. The first host in wins the sampler's fallback
+    /// multiplexer only: every monitor a host registers carries its topic's own connection
+    /// (<see cref="StreamPartitionMonitor.Connection"/>), so a topic on a named connection is sampled
+    /// on its own server.
     /// </remarks>
     private static bool AcquireLagSampler(IConnectionMultiplexer redis, ILogger log)
     {
