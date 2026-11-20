@@ -4,6 +4,18 @@ Every push to `main` publishes a new patch version automatically (see `version.j
 not manually tagged), so not every version number gets its own entry here. This file tracks what
 actually changed.
 
+## 2026-11-20
+
+### Fixed
+
+- **A topic added to the options after startup validation is guarded like a configured one.** The
+  outbox and `TopicForwarder` same-server guard read a topic's server from a value stamped only while
+  the options were validated, so a topic written into the bound `StreamOptions` later (an application
+  naming topics in code) was routed to its connection but never guarded. A topic's connection is now
+  resolved from its `Connection` name when it is used, and cached; every library lookup of a topic, and
+  the connection registry when the container builds it, ties the topic to its options. An unknown name
+  fails where it is used, naming the topic and the connection. Single-server mode is unchanged.
+
 ## 2026-11-11
 
 ### Added

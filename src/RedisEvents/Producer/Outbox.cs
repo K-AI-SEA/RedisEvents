@@ -601,13 +601,27 @@ public static class Outbox
     /// connection name a supported deployment.
     /// </summary>
     /// <remarks>
-    /// Only checked when the topic's options carry a resolved connection — that is, when they came
-    /// from a validated <see cref="StreamOptions"/> that uses <see cref="StreamOptions.Connections"/>.
-    /// In single-server mode, or for options built by hand, nothing is compared, as before.
+    /// Only checked when the topic's options resolve to a connection — that is, when they belong to
+    /// a <see cref="StreamOptions"/> that uses <see cref="StreamOptions.Connections"/>, whether the
+    /// topic was configured or added to the options after validation. The connection is resolved
+    /// here, on use, and cached. In single-server mode, or for options built by hand, nothing is
+    /// compared, as before.
     /// </remarks>
     internal static void RequireTopicServer(IDatabase db, string topic, TopicOptions effective)
     {
-        if (effective.ResolvedConnectionString is not { } expected)
+        string? expected;
+        try
+        {
+            expected = effective.ResolvedConnectionString;
+        }
+        catch (StreamConfigurationException ex)
+        {
+            throw new StreamConfigurationException(
+                $"Outbox: topic '{topic}' names connection '{effective.Connection}', which is not configured. {ex.Message}",
+                ex);
+        }
+
+        if (expected is null)
             return;
 
         if (Extensions.RedisServerIdentity.SameServer(db.Multiplexer, expected))

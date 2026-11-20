@@ -622,7 +622,7 @@ public static class StreamsBuilderExtensions
         if (registry.Publishers.Count == before)
             return builder;
 
-        var topicOptions = options.Topics.TryGetValue(topic, out var configured) ? configured : new TopicOptions();
+        var topicOptions = StreamConfigBinder.Configured(options, topic) ?? new TopicOptions();
 
         if (producer.Buffered)
         {
@@ -685,7 +685,7 @@ public static class StreamsBuilderExtensions
         ArgumentException.ThrowIfNullOrWhiteSpace(topic);
 
         var options = Core(builder);
-        var topicOptions = options.Topics.TryGetValue(topic, out var configured) ? configured : new TopicOptions();
+        var topicOptions = StreamConfigBinder.Configured(options, topic) ?? new TopicOptions();
 
         // Before the container is even built, not on the first append: an event store with no
         // transaction is not a weaker event store, it is a broken one.
