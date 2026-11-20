@@ -61,6 +61,10 @@ internal sealed class StreamsConnectionRegistry : IDisposable, IAsyncDisposable
 
         this.options = options;
         this.Default = defaultProvider;
+
+        // Built with the container, after every builder call: a topic added to the options since
+        // validation resolves its connection from here on, wherever it is read from.
+        StreamConfigBinder.Own(options);
         this.distinct.Add(defaultProvider);
 
         // Ordered by name so the grouping, and which name a shared provider is created for, does not
@@ -126,7 +130,18 @@ internal sealed class StreamsConnectionRegistry : IDisposable, IAsyncDisposable
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(topic);
 
-        var provider = this.ForName(StreamConfigBinder.NamedConnectionOf(this.options, topic));
+        var name = StreamConfigBinder.NamedConnectionOf(this.options, topic);
+        StreamsConnectionProvider provider;
+        try
+        {
+            provider = this.ForName(name);
+        }
+        catch (StreamConfigurationException ex) when (name is not null)
+        {
+            throw new StreamConfigurationException(
+                $"Streams: topic '{topic}' names connection '{name}', which is not configured. {ex.Message}",
+                ex);
+        }
 
         lock (this.gate)
         {

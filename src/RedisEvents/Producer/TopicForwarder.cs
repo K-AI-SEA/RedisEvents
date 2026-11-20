@@ -92,7 +92,7 @@ public sealed class TopicForwarder
 
         this.database = database;
         this.TargetTopic = targetTopic;
-        this.topicOptions = streamOptions.Topics.GetValueOrDefault(targetTopic);
+        this.topicOptions = StreamConfigBinder.Configured(streamOptions, targetTopic);
 
         // Every forward is an outbox transaction on the target topic, so a database on another server
         // is refused now, at construction, rather than on the first event.

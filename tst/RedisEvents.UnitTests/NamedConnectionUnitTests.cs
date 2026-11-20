@@ -83,12 +83,12 @@ public class NamedConnectionUnitTests
     }
 
     /// <summary>
-    /// Validation stamps every configured topic with its connection string once named connections
-    /// are in use — the default one for a topic that names none — and stamps nothing without them.
+    /// Every configured topic resolves to its connection string once named connections are in use —
+    /// the default one for a topic that names none — and to nothing without them.
     /// </summary>
     [Fact]
     [Trait("TestType", "UnitTest")]
-    public void Validation_stamps_each_topic_with_its_connection_only_when_connections_are_in_use()
+    public void Each_topic_resolves_to_its_connection_only_when_connections_are_in_use()
     {
         var named = new StreamOptions
         {
@@ -299,6 +299,129 @@ public class NamedConnectionUnitTests
         var report = StreamHealth.Evaluate(host.Services);
         report.Status.Should().Be(StreamHealthStatus.Unhealthy);
         report.Description.Should().Contain("6398", "the named connection's endpoint is reported");
+    }
+
+    /// <summary>
+    /// A topic written into the bound options after startup validation — as an application that
+    /// names topics in code does — is routed to its connection and guarded like a configured one,
+    /// with nothing stamped by hand.
+    /// </summary>
+    [Fact]
+    [Trait("TestType", "UnitTest")]
+    public void A_topic_added_after_validation_is_routed_and_guarded()
+    {
+        var options = new StreamOptions
+        {
+            ConnectionString = "10.0.0.1:6379",
+            Connections = { ["feed"] = "10.0.0.2:6379,abortConnect=false" },
+        };
+        using var registry = Registry(options);
+
+        options.Topics["orders"] = new TopicOptions { Connection = "feed" };
+
+        registry.ForTopic("orders").Should().BeSameAs(registry.ForName("feed"));
+        var topic = options.Topics["orders"];
+        topic.ResolvedConnectionString.Should().Be("10.0.0.2:6379,abortConnect=false");
+
+        Outbox.RequireTopicServer(FakeDatabase.At("10.0.0.2:6379"), "orders", topic);
+        var wrong = () => Outbox.RequireTopicServer(FakeDatabase.At("10.0.0.1:6379"), "orders", topic);
+        wrong.Should().Throw<StreamConfigurationException>().WithMessage("*'orders' lives on 10.0.0.2:6379 (connection 'feed')*10.0.0.1:6379*");
+
+        var forward = () => new TopicForwarder(FakeDatabase.At("10.0.0.1:6379"), "orders", options);
+        forward.Should().Throw<StreamConfigurationException>("the forwarder looks the topic up itself");
+    }
+
+    /// <summary>
+    /// The same through a host: a topic added to the bound options between builder calls, after the
+    /// first one validated them, is on its connection once the container is built — read straight out
+    /// of the options, as a service's own outbox call does — and its store is registered on it.
+    /// </summary>
+    [Fact]
+    [Trait("TestType", "UnitTest")]
+    public async Task A_topic_added_to_the_bound_options_between_builder_calls_is_guarded_in_the_built_host()
+    {
+        var builder = Host.CreateEmptyApplicationBuilder(new HostApplicationBuilderSettings { EnvironmentName = "Production" });
+        builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Streams:ConnectionString"] = "10.0.0.1:6379,abortConnect=false",
+            ["Streams:Connections:feed"] = "10.0.0.2:6379,abortConnect=false",
+        });
+        builder.AddStreamPublisher("audit");
+        var bound = (StreamOptions)builder.Services.Single(d => d.ServiceType == typeof(StreamOptions)).ImplementationInstance!;
+        bound.Topics["orders"] = new TopicOptions { Connection = "feed" };
+        builder.AddStreamStore("orders");
+
+        using var host = builder.Build();
+        var registry = host.Services.GetRequiredService<StreamsConnectionRegistry>();
+        var topic = host.Services.GetRequiredService<StreamOptions>().Topics["orders"];
+
+        topic.ResolvedConnectionString.Should().Be("10.0.0.2:6379,abortConnect=false");
+        registry.ForTopic("orders").Should().BeSameAs(registry.ForName("feed"));
+
+        var write = () => Outbox.WriteAndPublishAsync(
+            FakeDatabase.At("10.0.0.1:6379"),
+            _ => { },
+            "orders",
+            "k",
+            new byte[] { 1 },
+            "t",
+            topicOptions: topic);
+        await write.Should().ThrowAsync<StreamConfigurationException>().WithMessage("*'orders' lives on 10.0.0.2:6379*");
+    }
+
+    /// <summary>A topic added after validation that names an unknown connection fails where it is used, naming both.</summary>
+    [Fact]
+    [Trait("TestType", "UnitTest")]
+    public void A_topic_added_after_validation_naming_an_unknown_connection_fails_on_use()
+    {
+        var options = new StreamOptions
+        {
+            ConnectionString = "10.0.0.1:6379",
+            Connections = { ["feed"] = "10.0.0.2:6379" },
+        };
+        using var registry = Registry(options);
+
+        options.Topics["orders"] = new TopicOptions { Connection = "bet" };
+
+        var route = () => registry.ForTopic("orders");
+        route.Should().Throw<StreamConfigurationException>().WithMessage("*topic 'orders'*'bet'*feed*");
+
+        var guard = () => Outbox.RequireTopicServer(FakeDatabase.At("10.0.0.2:6379"), "orders", options.Topics["orders"]);
+        guard.Should().Throw<StreamConfigurationException>().WithMessage("*topic 'orders'*'bet'*feed*");
+    }
+
+    /// <summary>Without named connections a topic added later resolves to nothing and is not guarded, as before.</summary>
+    [Fact]
+    [Trait("TestType", "UnitTest")]
+    public void A_topic_added_after_validation_in_single_server_mode_resolves_to_nothing()
+    {
+        var options = new StreamOptions { ConnectionString = "10.0.0.1:6379" };
+        using var registry = Registry(options);
+
+        options.Topics["orders"] = new TopicOptions();
+
+        registry.ForTopic("orders").Should().BeSameAs(registry.Default);
+        options.Topics["orders"].ResolvedConnectionString.Should().BeNull();
+        Outbox.RequireTopicServer(FakeDatabase.At("10.0.0.9:6379"), "orders", options.Topics["orders"]);
+    }
+
+    /// <summary>Resolving a topic's connection is not part of its value: record equality is unchanged.</summary>
+    [Fact]
+    [Trait("TestType", "UnitTest")]
+    public void A_resolved_topic_still_equals_the_same_options_unresolved()
+    {
+        var options = new StreamOptions
+        {
+            Connections = { ["feed"] = "10.0.0.2:6379" },
+            Topics = { ["orders"] = new TopicOptions { Connection = "feed", Partitions = 4 } },
+        };
+        StreamConfigBinder.Validate(options);
+        _ = options.Topics["orders"].ResolvedConnectionString;
+
+        var plain = new TopicOptions { Connection = "feed", Partitions = 4 };
+
+        options.Topics["orders"].Should().Be(plain);
+        options.Topics["orders"].GetHashCode().Should().Be(plain.GetHashCode());
     }
 
     [Fact]

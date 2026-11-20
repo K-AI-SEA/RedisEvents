@@ -167,7 +167,7 @@ internal static class StreamConfigBinder
         ArgumentNullException.ThrowIfNull(options);
         ArgumentException.ThrowIfNullOrWhiteSpace(topic);
 
-        if (options.Topics.TryGetValue(topic, out var configured))
+        if (Configured(options, topic) is { } configured)
             return configured;
 
         var defaulted = new TopicOptions();
@@ -242,11 +242,34 @@ internal static class StreamConfigBinder
     {
         ArgumentNullException.ThrowIfNull(options);
 
-        return options.Topics.TryGetValue(topic, out var configured)
-            && configured is not null
-            && !string.IsNullOrWhiteSpace(configured.Connection)
-                ? configured.Connection
-                : null;
+        return Configured(options, topic) is { } configured && !string.IsNullOrWhiteSpace(configured.Connection)
+            ? configured.Connection
+            : null;
+    }
+
+    /// <summary>
+    /// A topic's entry in <see cref="StreamOptions.Topics"/>, or <see langword="null"/>, tied to
+    /// <paramref name="options"/> so its connection resolves on use. A topic added to the options
+    /// after validation is routed and guarded from the first time the library looks it up.
+    /// </summary>
+    /// <param name="options">The root options.</param>
+    /// <param name="topic">The topic name.</param>
+    /// <returns>The configured entry, or <see langword="null"/>.</returns>
+    internal static TopicOptions? Configured(StreamOptions options, string topic)
+    {
+        if (!options.Topics.TryGetValue(topic, out var configured) || configured is null)
+            return null;
+
+        configured.BelongsTo(options);
+        return configured;
+    }
+
+    /// <summary>Ties every entry of <see cref="StreamOptions.Topics"/> to <paramref name="options"/>; see <see cref="Configured"/>.</summary>
+    /// <param name="options">The root options.</param>
+    internal static void Own(StreamOptions options)
+    {
+        foreach (var topic in options.Topics.Values)
+            topic?.BelongsTo(options);
     }
 
     /// <summary>
@@ -350,9 +373,9 @@ internal static class StreamConfigBinder
 
     /// <summary>
     /// Checks <see cref="StreamOptions.Connections"/> and every topic's
-    /// <see cref="TopicOptions.Connection"/>, then stamps each configured topic with the connection
-    /// string it resolves to so the outbox can guard against a write through another server. With no
-    /// named connections nothing is stamped: single-server mode is unchanged.
+    /// <see cref="TopicOptions.Connection"/>, and ties each configured topic to the options so the
+    /// outbox can resolve its server on use and guard against a write through another one. With no
+    /// named connections nothing resolves: single-server mode is unchanged.
     /// </summary>
     private static void ValidateConnections(StreamOptions options)
     {
@@ -400,9 +423,7 @@ internal static class StreamConfigBinder
                 }
             }
 
-            topic.ResolvedConnectionString = options.Connections.Count == 0
-                ? null
-                : ResolveConnectionString(options, topicName);
+            topic.BelongsTo(options);
         }
     }
 

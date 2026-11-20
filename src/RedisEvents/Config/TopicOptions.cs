@@ -121,11 +121,76 @@ public sealed record TopicOptions
     /// </remarks>
     public string? Connection { get; set; }
 
+    private ConnectionBinding binding = ConnectionBinding.None;
+
     /// <summary>
-    /// The connection string this topic resolves to, stamped when the options are validated and
-    /// <see cref="StreamOptions.Connections"/> is in use; <see langword="null"/> in single-server
-    /// mode. The outbox compares a database's endpoint against it, so a transaction can never write a
-    /// topic's keys onto another server. Internal: not a configuration key.
+    /// The connection string this topic lives on, resolved from <see cref="Connection"/> when read
+    /// (and cached) once the topic belongs to a <see cref="StreamOptions"/> that uses
+    /// <see cref="StreamOptions.Connections"/>; <see langword="null"/> in single-server mode and for
+    /// options built by hand. The outbox compares a database's endpoint against it, so a transaction
+    /// can never write a topic's keys onto another server. Internal: not a configuration key.
     /// </summary>
-    internal string? ResolvedConnectionString { get; set; }
+    /// <remarks>
+    /// Resolved on use rather than stamped at validation, so a topic added to the options after
+    /// startup validation is guarded exactly like a configured one. Setting it pins the value.
+    /// </remarks>
+    /// <exception cref="Errors.StreamConfigurationException">
+    /// <see cref="Connection"/> names a connection the owning options do not configure.
+    /// </exception>
+    internal string? ResolvedConnectionString
+    {
+        get => this.binding.Resolve(this.Connection);
+        set => this.binding = new ConnectionBinding(this.binding.Owner, value);
+    }
+
+    /// <summary>
+    /// Records the options this topic belongs to, whose connections <see cref="ResolvedConnectionString"/>
+    /// resolves against. Every library path that looks a topic up in <see cref="StreamOptions.Topics"/> calls it.
+    /// </summary>
+    /// <param name="owner">The options holding this topic.</param>
+    internal void BelongsTo(StreamOptions owner)
+    {
+        if (!ReferenceEquals(this.binding.Owner, owner))
+            this.binding = new ConnectionBinding(owner, this.binding.Pinned);
+    }
+
+    /// <summary>
+    /// Where the topic's connection is resolved from, and the cached answer. Not part of the topic's
+    /// value: it compares equal to every other binding, so record equality and hashing see only the
+    /// configured members.
+    /// </summary>
+    private sealed class ConnectionBinding(StreamOptions? owner, string? pinned)
+    {
+        public static readonly ConnectionBinding None = new(null, null);
+
+        private Resolved? cache;
+
+        public StreamOptions? Owner => owner;
+
+        public string? Pinned => pinned;
+
+        public string? Resolve(string? name)
+        {
+            if (pinned is not null)
+                return pinned;
+
+            if (owner is null || owner.Connections is not { Count: > 0 })
+                return null;
+
+            if (this.cache is { } cached && string.Equals(cached.Name, name, StringComparison.Ordinal))
+                return cached.ConnectionString;
+
+            var connectionString = string.IsNullOrWhiteSpace(name)
+                ? StreamConfigBinder.ResolveConnectionString(owner)
+                : StreamConfigBinder.NamedConnectionString(owner, name);
+            this.cache = new Resolved(name, connectionString);
+            return connectionString;
+        }
+
+        public override bool Equals(object? obj) => obj is ConnectionBinding;
+
+        public override int GetHashCode() => 0;
+
+        private sealed record Resolved(string? Name, string ConnectionString);
+    }
 }
