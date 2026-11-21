@@ -11,7 +11,10 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'lode-ci' }}
+    env:
+      # Box runners use host networking; without this Testcontainers reports the Docker gateway IP.
+      TESTCONTAINERS_HOST_OVERRIDE: 127.0.0.1
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,7 +52,7 @@ jobs:
   publish:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'lode-ci' }}
     environment: production
     permissions:
       contents: write

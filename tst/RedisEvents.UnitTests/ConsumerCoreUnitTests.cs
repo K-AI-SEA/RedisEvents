@@ -340,7 +340,8 @@ public class ProcessBatchAccountingTests
     [Trait("TestType", "UnitTest")]
     public async Task A_blocked_batch_does_not_record_its_retry_period_as_batch_duration()
     {
-        const int delayMs = 300;
+        // Well above any real batch: the histogram also sees batches from tests running in parallel.
+        const int delayMs = 1000;
 
         PartitionWorker.BlockDelay = static (_, ct) => Task.Delay(delayMs, ct);
 
